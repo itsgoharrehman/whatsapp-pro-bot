@@ -16,6 +16,10 @@ const fs = require('fs');
 const path = require('path');
 const https = require('https');
 const express = require('express');
+let qrcode = null;
+try {
+    qrcode = require('qrcode-terminal');
+} catch (e) {}
 
 const botSentMessageIds = new Set();
 
@@ -781,7 +785,16 @@ async function startBot() {
 
         if (qr) {
             currentQR = qr;
-            console.log('[AUTH] New QR Code generated. View at web root /');
+            console.log('\n==========================================');
+            console.log('   SCAN THIS QR CODE IN WHATSAPP');
+            console.log('   (Settings > Linked Devices > Link a Device)');
+            console.log('==========================================');
+            if (qrcode) {
+                try {
+                    qrcode.generate(qr, { small: true });
+                } catch (e) {}
+            }
+            console.log('[AUTH] QR Code is also viewable in browser at http://localhost:' + PORT + '/\n');
         }
 
         if (connection === 'connecting') {
