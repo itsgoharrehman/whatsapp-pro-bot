@@ -1,0 +1,18 @@
+# Security & Credentials
+config.json
+.env
+.env.local
+.env.production
+auth_info/
+
+# Allow sample template
+!.env.example
+
+# Media scratch & temporary files
+media/
+scratch/
+*.log
+
+# Dependencies
+node_modules/
+package-lock.json
