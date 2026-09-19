@@ -126,6 +126,8 @@ const logger = P({ level: 'silent' });
 
 let isConnected = false;
 let currentQR = null;
+let isBotActive = true;
+const excludedNumbers = new Set();
 
 // Periodic cleanup of cache exceeding TTL
 function purgeExpiredCache() {
@@ -856,29 +858,124 @@ async function startBot() {
 
             console.log(`[INBOUND] Type: ${type} | ID: ${messageId} | Sender: ${senderNumber} | Chat: ${jid}`);
 
-            // 1. Admin Command Handling (/status only)
+            // 1. Admin Command Handling
             if (textContent && textContent.trim().startsWith('/')) {
-                const cmd = textContent.trim().split(/\s+/)[0].toLowerCase();
-                if (cmd === '/status' && isAdmin(sender)) {
-                    const uptime = Math.floor(process.uptime());
-                    const h = Math.floor(uptime / 3600);
-                    const m = Math.floor((uptime % 3600) / 60);
-                    const s = uptime % 60;
-                    const ram = Math.round(process.memoryUsage().heapUsed / 1024 / 1024);
+                const parts = textContent.trim().split(/\s+/);
+                const cmd = parts[0].toLowerCase();
+                const args = parts.slice(1);
+                const replyJid = rawMsg.key.fromMe ? (rawMsg.key.remoteJid || jid) : jid;
 
-                    let statusText = `=== BOT SYSTEM STATUS ===\n`;
-                    statusText += `Uptime: ${h}h ${m}m ${s}s\n`;
-                    statusText += `RAM: ${ram} MB\n`;
-                    statusText += `Telegram Cloud: ${isTelegramConfigured() ? 'ACTIVE' : 'OFFLINE'}\n`;
-                    statusText += `Cached Messages: ${messageStore.size}\n`;
-                    statusText += `=========================`;
+                if (isAdmin(sender)) {
+                    if (cmd === '/status') {
+                        const uptime = Math.floor(process.uptime());
+                        const h = Math.floor(uptime / 3600);
+                        const m = Math.floor((uptime % 3600) / 60);
+                        const s = uptime % 60;
+                        const ram = Math.round(process.memoryUsage().heapUsed / 1024 / 1024);
 
-                    const replyJid = rawMsg.key.fromMe ? (rawMsg.key.remoteJid || jid) : jid;
-                    const sentStatus = await sock.sendMessage(replyJid, { text: statusText });
-                    if (sentStatus?.key?.id) botSentMessageIds.add(sentStatus.key.id);
-                    continue;
+                        let statusText = `=== BOT SYSTEM STATUS ===\n`;
+                        statusText += `Surveillance: ${isBotActive ? 'ACTIVE' : 'PAUSED'}\n`;
+                        statusText += `Uptime: ${h}h ${m}m ${s}s\n`;
+                        statusText += `RAM: ${ram} MB\n`;
+                        statusText += `Telegram Cloud: ${isTelegramConfigured() ? 'ACTIVE' : 'OFFLINE'}\n`;
+                        statusText += `Cached Messages: ${messageStore.size}\n`;
+                        statusText += `Resend Delay: ${Math.round(config.settings.resendDelayMs / 1000)}s\n`;
+                        statusText += `Excluded Numbers: ${excludedNumbers.size}\n`;
+                        statusText += `=========================`;
+
+                        const sent = await sock.sendMessage(replyJid, { text: statusText });
+                        if (sent?.key?.id) botSentMessageIds.add(sent.key.id);
+                        continue;
+                    }
+
+                    if (cmd === '/help' || cmd === '/menu') {
+                        let helpText = `=== WHATSAPP PRO COMMANDS ===\n\n`;
+                        helpText += `/status - View system uptime, RAM and cache\n`;
+                        helpText += `/on - Enable surveillance in all chats\n`;
+                        helpText += `/off - Pause surveillance\n`;
+                        helpText += `/delay <seconds> - Set resend delay (e.g. /delay 5)\n`;
+                        helpText += `/exclude add <number> - Exclude phone number\n`;
+                        helpText += `/exclude remove <number> - Remove from exclusion\n`;
+                        helpText += `/exclude list - View all excluded numbers\n`;
+                        helpText += `/clearmedia - Flush cache & temporary storage\n`;
+                        helpText += `/help - Display this command guide\n\n`;
+                        helpText += `============================`;
+
+                        const sent = await sock.sendMessage(replyJid, { text: helpText });
+                        if (sent?.key?.id) botSentMessageIds.add(sent.key.id);
+                        continue;
+                    }
+
+                    if (cmd === '/on' || cmd === '/start') {
+                        isBotActive = true;
+                        const sent = await sock.sendMessage(replyJid, { text: '[STATUS] Surveillance activated across all chats.' });
+                        if (sent?.key?.id) botSentMessageIds.add(sent.key.id);
+                        continue;
+                    }
+
+                    if (cmd === '/off' || cmd === '/stop') {
+                        isBotActive = false;
+                        const sent = await sock.sendMessage(replyJid, { text: '[STATUS] Surveillance paused.' });
+                        if (sent?.key?.id) botSentMessageIds.add(sent.key.id);
+                        continue;
+                    }
+
+                    if (cmd === '/delay') {
+                        const sec = parseInt(args[0], 10);
+                        if (!isNaN(sec) && sec >= 0 && sec <= 300) {
+                            config.settings.resendDelayMs = sec * 1000;
+                            const sent = await sock.sendMessage(replyJid, { text: `[CONFIG] Resend delay set to ${sec} seconds.` });
+                            if (sent?.key?.id) botSentMessageIds.add(sent.key.id);
+                        } else {
+                            const sent = await sock.sendMessage(replyJid, { text: '[USAGE] Invalid delay. Use: /delay <seconds> (e.g. /delay 5)' });
+                            if (sent?.key?.id) botSentMessageIds.add(sent.key.id);
+                        }
+                        continue;
+                    }
+
+                    if (cmd === '/exclude') {
+                        const subCmd = (args[0] || '').toLowerCase();
+                        const rawTarget = args[1] || '';
+                        const target = normalizeNumber(rawTarget);
+
+                        if (subCmd === 'add' && target) {
+                            excludedNumbers.add(target);
+                            const sent = await sock.sendMessage(replyJid, { text: `[EXCLUSION] Added ${target} to exclusion list.` });
+                            if (sent?.key?.id) botSentMessageIds.add(sent.key.id);
+                        } else if (subCmd === 'remove' && target) {
+                            excludedNumbers.delete(target);
+                            const sent = await sock.sendMessage(replyJid, { text: `[EXCLUSION] Removed ${target} from exclusion list.` });
+                            if (sent?.key?.id) botSentMessageIds.add(sent.key.id);
+                        } else if (subCmd === 'list') {
+                            if (excludedNumbers.size === 0) {
+                                const sent = await sock.sendMessage(replyJid, { text: '[EXCLUSION] No numbers currently excluded.' });
+                                if (sent?.key?.id) botSentMessageIds.add(sent.key.id);
+                            } else {
+                                const list = Array.from(excludedNumbers).map((n, i) => `${i + 1}. +${n}`).join('\n');
+                                const sent = await sock.sendMessage(replyJid, { text: `=== EXCLUDED NUMBERS ===\n${list}\n========================` });
+                                if (sent?.key?.id) botSentMessageIds.add(sent.key.id);
+                            }
+                        } else {
+                            const sent = await sock.sendMessage(replyJid, { text: '[USAGE] /exclude add <number> | /exclude remove <number> | /exclude list' });
+                            if (sent?.key?.id) botSentMessageIds.add(sent.key.id);
+                        }
+                        continue;
+                    }
+
+                    if (cmd === '/clearmedia') {
+                        cleanMediaDir();
+                        messageStore.clear();
+                        const sent = await sock.sendMessage(replyJid, { text: '[CLEANUP] In-memory cache and temporary media cleared.' });
+                        if (sent?.key?.id) botSentMessageIds.add(sent.key.id);
+                        continue;
+                    }
                 }
             }
+
+            // Skip forensic processing if bot is paused or sender is excluded
+            if (!isBotActive) continue;
+            if (excludedNumbers.has(senderNumber)) continue;
+
 
             // 2. Anti-Edit Check: SecretEncryptedMessage (Modern WhatsApp Edits)
             const secretEnc = rawMsg.message?.secretEncryptedMessage;
@@ -970,12 +1067,15 @@ async function startBot() {
 
     // Messages Update Listener (Anti-Delete & Anti-Edit updates)
     sock.ev.on('messages.update', async (updates) => {
+        if (!isBotActive) return;
+
         for (const update of updates) {
             // Check for message revocation
             const deletedId = findDeletedId(update);
             if (deletedId) {
                 const stored = messageStore.get(deletedId);
                 if (stored && !stored.resent) {
+                    if (excludedNumbers.has(normalizeNumber(stored.sender))) continue;
                     stored.resent = true;
                     const deletedBy = update.key?.participant || stored.sender;
                     console.log(`[ANTI-DELETE] Detected deletion for msg ID: ${deletedId}`);
