@@ -8,6 +8,8 @@ const {
     aesDecryptGCM,
     hmacSign,
     jidNormalizedUser,
+    isJidUser,
+    isLidUser,
     proto
 } = require('@whiskeysockets/baileys');
 const { Boom } = require('@hapi/boom');
@@ -22,6 +24,9 @@ try {
 } catch (e) {}
 
 const botSentMessageIds = new Set();
+const processedCommandIds = new Set();
+let botStartTime = Date.now();
+let botConnectTime = null;
 
 // ==========================================
 // CONFIGURATION & CREDENTIAL MANAGEMENT
@@ -129,7 +134,187 @@ let currentQR = null;
 let isBotActive = true;
 let currentSock = null;
 let isTerminating = false;
-const excludedNumbers = new Set();
+
+const EXCLUDE_FILE = path.join(__dirname, 'excluded.json');
+const LID_MAP_FILE = path.join(__dirname, 'lid_mappings.json');
+
+const lidToPhoneMap = new Map();
+const phoneToLidMap = new Map();
+
+function normalizeNumber(jid) {
+    if (!jid) return '';
+    if (typeof jid !== 'string') jid = String(jid);
+    let base = jid.split('@')[0].split(':')[0].replace(/[^0-9]/g, '');
+    if (base.startsWith('0') && base.length === 11) {
+        base = '92' + base.slice(1);
+    }
+    return base;
+}
+
+function loadLidMappings() {
+    try {
+        if (fs.existsSync(LID_MAP_FILE)) {
+            const raw = fs.readFileSync(LID_MAP_FILE, 'utf-8');
+            const data = JSON.parse(raw);
+            if (data && typeof data === 'object') {
+                for (const [lid, phone] of Object.entries(data)) {
+                    const cleanLid = normalizeNumber(lid);
+                    const cleanPhone = normalizeNumber(phone);
+                    if (cleanLid && cleanPhone) {
+                        lidToPhoneMap.set(cleanLid, cleanPhone);
+                        phoneToLidMap.set(cleanPhone, cleanLid);
+                    }
+                }
+            }
+        }
+    } catch (e) {
+        console.error('[LID-MAP] Failed loading lid_mappings.json:', e.message);
+    }
+}
+
+function saveLidMappings() {
+    try {
+        const obj = {};
+        for (const [lid, phone] of lidToPhoneMap) {
+            obj[lid] = phone;
+        }
+        fs.writeFileSync(LID_MAP_FILE, JSON.stringify(obj, null, 2));
+    } catch (e) {
+        console.error('[LID-MAP] Failed saving lid_mappings.json:', e.message);
+    }
+}
+
+loadLidMappings();
+
+async function syncGroupMetadata(sock, groupJid) {
+    if (!sock || !groupJid || !groupJid.endsWith('@g.us')) return;
+    try {
+        const meta = await sock.groupMetadata(groupJid);
+        if (meta && Array.isArray(meta.participants)) {
+            let changed = false;
+            for (const p of meta.participants) {
+                const phone = normalizeNumber(p.jid || (isJidUser(p.id) ? p.id : ''));
+                const lid = normalizeNumber(p.lid || (isLidUser(p.id) ? p.id : ''));
+                if (phone && lid && phone !== lid) {
+                    if (lidToPhoneMap.get(lid) !== phone) {
+                        lidToPhoneMap.set(lid, phone);
+                        phoneToLidMap.set(phone, lid);
+                        changed = true;
+                    }
+                }
+            }
+            if (changed) {
+                saveLidMappings();
+                console.log(`[LID-MAP] Synced ${meta.participants.length} identities from ${groupJid}`);
+            }
+        }
+    } catch (e) {}
+}
+
+async function syncAllGroups(sock) {
+    if (!sock) return;
+    try {
+        const groups = await sock.groupFetchAllParticipating();
+        let changed = false;
+        for (const [gid, meta] of Object.entries(groups)) {
+            if (meta && Array.isArray(meta.participants)) {
+                for (const p of meta.participants) {
+                    const phone = normalizeNumber(p.jid || (isJidUser(p.id) ? p.id : ''));
+                    const lid = normalizeNumber(p.lid || (isLidUser(p.id) ? p.id : ''));
+                    if (phone && lid && phone !== lid) {
+                        if (lidToPhoneMap.get(lid) !== phone) {
+                            lidToPhoneMap.set(lid, phone);
+                            phoneToLidMap.set(phone, lid);
+                            changed = true;
+                        }
+                    }
+                }
+            }
+        }
+        if (changed) {
+            saveLidMappings();
+            console.log(`[LID-MAP] Mapped ${lidToPhoneMap.size} user identities (LID <-> Phone).`);
+        }
+    } catch (e) {
+        console.log('[LID-MAP] Group sync status:', e.message);
+    }
+}
+
+function isExcludedNumberMatch(numA, numB) {
+    if (!numA || !numB) return false;
+    const a = String(numA).replace(/[^0-9]/g, '');
+    const b = String(numB).replace(/[^0-9]/g, '');
+    if (!a || !b) return false;
+    if (a === b) return true;
+    if (a.length >= 7 && b.length >= 7) {
+        if (a.endsWith(b) || b.endsWith(a)) return true;
+    }
+    return false;
+}
+
+function resolveAllIdentifiers(target) {
+    if (!target) return [];
+    if (typeof target !== 'string') target = String(target);
+    const clean = normalizeNumber(target);
+    if (!clean) return [];
+
+    const candidates = new Set([clean]);
+
+    const phone = lidToPhoneMap.get(clean);
+    if (phone) {
+        candidates.add(phone);
+        const np = normalizeNumber(phone);
+        if (np) candidates.add(np);
+    }
+
+    const lid = phoneToLidMap.get(clean);
+    if (lid) {
+        candidates.add(lid);
+        const nl = normalizeNumber(lid);
+        if (nl) candidates.add(nl);
+    }
+
+    return Array.from(candidates);
+}
+
+function loadExcludedNumbers() {
+    try {
+        if (fs.existsSync(EXCLUDE_FILE)) {
+            const raw = fs.readFileSync(EXCLUDE_FILE, 'utf-8');
+            const arr = JSON.parse(raw);
+            if (Array.isArray(arr)) {
+                return new Set(arr.map(n => normalizeNumber(n)).filter(Boolean));
+            }
+        }
+    } catch (e) {
+        console.error('[EXCLUSION] Failed loading excluded.json:', e.message);
+    }
+    return new Set();
+}
+
+const excludedNumbers = loadExcludedNumbers();
+
+function saveExcludedNumbers() {
+    try {
+        fs.writeFileSync(EXCLUDE_FILE, JSON.stringify(Array.from(excludedNumbers), null, 2));
+    } catch (e) {
+        console.error('[EXCLUSION] Failed saving excluded.json:', e.message);
+    }
+}
+
+function isExcluded(target) {
+    if (!target) return false;
+    const candidates = resolveAllIdentifiers(target);
+    for (const cand of candidates) {
+        for (const num of excludedNumbers) {
+            const exCandidates = resolveAllIdentifiers(num);
+            for (const exCand of exCandidates) {
+                if (isExcludedNumberMatch(cand, exCand)) return true;
+            }
+        }
+    }
+    return false;
+}
 
 async function terminateSession() {
     if (isTerminating) return { success: false, message: 'Termination already in progress' };
@@ -852,14 +1037,14 @@ app.listen(PORT, () => {
 // ==========================================
 // PARSERS & CRYPTOGRAPHIC HELPERS
 // ==========================================
-function normalizeNumber(jid) {
-    if (!jid) return '';
-    return jid.split('@')[0].split(':')[0].replace(/[^0-9]/g, '');
-}
-
 function isAdmin(jid) {
-    const num = normalizeNumber(jid);
-    return config.admins.some(admin => normalizeNumber(admin) === num);
+    const candidates = resolveAllIdentifiers(jid);
+    for (const cand of candidates) {
+        if (config.admins.some(admin => isExcludedNumberMatch(normalizeNumber(admin), cand))) {
+            return true;
+        }
+    }
+    return false;
 }
 
 function getTextMessage(msg) {
@@ -1068,6 +1253,11 @@ async function handleEditedNotification(sock, jid, targetId, editedMessageObj, e
         return;
     }
 
+    if (isExcluded(stored.sender) || isExcluded(stored.originJid) || isExcluded(jid)) {
+        console.log(`[EXCLUSION] Suppressed edit notification for excluded target ID: ${targetId}`);
+        return;
+    }
+
     const originalText = stored.lastKnownText || getTextMessage(stored.msg);
     let newText = explicitNewText;
 
@@ -1133,6 +1323,11 @@ async function downloadMediaMessageDirect(mediaMsg, type) {
 }
 
 async function resendDeletedMessage(sock, stored, deletedBy) {
+    if (!stored) return;
+    if (isExcluded(stored.sender) || isExcluded(stored.originJid) || isExcluded(deletedBy)) {
+        console.log(`[EXCLUSION] Suppressed resending deleted message from excluded contact.`);
+        return;
+    }
     const { msg, rawMsg, sender, originJid, messageType, isPrivateChat } = stored;
     const messageId = rawMsg?.key?.id;
     const senderNumber = normalizeNumber(sender);
@@ -1250,6 +1445,18 @@ async function startBot() {
     console.log('   2. Anti-Edit                           ');
     console.log('==========================================\n');
 
+    botStartTime = Date.now();
+    if (process.env.CLEAR_AUTH_ON_BOOT === 'true' || process.env.RESET_AUTH === 'true') {
+        try {
+            if (fs.existsSync(AUTH_DIR)) {
+                fs.rmSync(AUTH_DIR, { recursive: true, force: true });
+                console.log('[AUTH] Purged auth_info directory on boot as requested.');
+            }
+            fs.mkdirSync(AUTH_DIR, { recursive: true });
+        } catch (e) {
+            console.error('[AUTH] Failed clearing auth_info on boot:', e.message);
+        }
+    }
     const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
 
     const sock = makeWASocket({
@@ -1292,8 +1499,10 @@ async function startBot() {
 
         if (connection === 'open') {
             isConnected = true;
+            botConnectTime = Date.now();
             currentQR = null;
             console.log('\n[CONNECTED] WhatsApp Pro Bot is online.');
+            syncAllGroups(sock).catch(() => {});
         }
 
         if (connection === 'close') {
@@ -1326,6 +1535,16 @@ async function startBot() {
 
     sock.ev.on('creds.update', saveCreds);
 
+    sock.ev.on('group-participants.update', async ({ id }) => {
+        syncGroupMetadata(sock, id).catch(() => {});
+    });
+
+    sock.ev.on('groups.update', async (groups) => {
+        for (const g of groups) {
+            if (g.id) syncGroupMetadata(sock, g.id).catch(() => {});
+        }
+    });
+
     // Messages Upsert Listener
     sock.ev.on('messages.upsert', async ({ messages, type }) => {
         for (const rawMsg of messages) {
@@ -1354,6 +1573,10 @@ async function startBot() {
             const senderNumber = normalizeNumber(sender);
             const messageId = rawMsg.key.id;
 
+            if (isGroup && sender && !lidToPhoneMap.has(senderNumber)) {
+                syncGroupMetadata(sock, jid).catch(() => {});
+            }
+
             console.log(`[INBOUND] Type: ${type} | ID: ${messageId} | Sender: ${senderNumber} | Chat: ${jid}`);
 
             // 1. Admin Command Handling
@@ -1363,7 +1586,23 @@ async function startBot() {
                 const args = parts.slice(1);
                 const replyJid = rawMsg.key.fromMe ? (rawMsg.key.remoteJid || jid) : jid;
 
+                // Completely ignore any offline sync or non-live event
+                if (type !== 'notify') continue;
+                if (!isConnected || !botConnectTime) continue;
+
+                const msgTime = rawMsg.messageTimestamp ? (Number(rawMsg.messageTimestamp) * 1000) : 0;
+                // Discard messages sent prior to connection or older than 15 seconds
+                if (msgTime < botConnectTime || (Date.now() - msgTime) > 15000) {
+                    console.log(`[COMMAND] Ignored stale/buffered command ${cmd}`);
+                    continue;
+                }
+
                 if (isAdmin(sender)) {
+                    if (processedCommandIds.has(messageId)) {
+                        console.log(`[COMMAND] Ignored duplicate event for command ${cmd} (${messageId})`);
+                        continue;
+                    }
+                    processedCommandIds.add(messageId);
                     if (cmd === '/status') {
                         const uptime = Math.floor(process.uptime());
                         const h = Math.floor(uptime / 3600);
@@ -1386,32 +1625,32 @@ async function startBot() {
                         continue;
                     }
 
-                    if (cmd === '/help' || cmd === '/menu') {
-                        let helpText = `=== WHATSAPP PRO COMMANDS ===\n\n`;
-                        helpText += `/status - View system uptime, RAM and cache\n`;
-                        helpText += `/on - Enable surveillance in all chats\n`;
+                    if (cmd === '/help') {
+                        let helpText = `=== BOT COMMANDS ===\n\n`;
+                        helpText += `/status - System status\n`;
+                        helpText += `/on - Enable surveillance\n`;
                         helpText += `/off - Pause surveillance\n`;
-                        helpText += `/delay <seconds> - Set resend delay (e.g. /delay 5)\n`;
-                        helpText += `/exclude add <number> - Exclude phone number\n`;
-                        helpText += `/exclude remove <number> - Remove from exclusion\n`;
-                        helpText += `/exclude list - View all excluded numbers\n`;
-                        helpText += `/clearmedia - Flush cache & temporary storage\n`;
-                        helpText += `/help - Display this command guide\n\n`;
-                        helpText += `============================`;
+                        helpText += `/delay <seconds> - Set resend delay\n`;
+                        helpText += `/exclude <number> - Exclude phone number\n`;
+                        helpText += `/unexclude <number> - Remove from exclusion\n`;
+                        helpText += `/list - View excluded numbers\n`;
+                        helpText += `/clear - Flush cache and storage\n`;
+                        helpText += `/help - Display commands\n\n`;
+                        helpText += `====================`;
 
                         const sent = await sock.sendMessage(replyJid, { text: helpText });
                         if (sent?.key?.id) botSentMessageIds.add(sent.key.id);
                         continue;
                     }
 
-                    if (cmd === '/on' || cmd === '/start') {
+                    if (cmd === '/on') {
                         isBotActive = true;
-                        const sent = await sock.sendMessage(replyJid, { text: '[STATUS] Surveillance activated across all chats.' });
+                        const sent = await sock.sendMessage(replyJid, { text: '[STATUS] Surveillance activated.' });
                         if (sent?.key?.id) botSentMessageIds.add(sent.key.id);
                         continue;
                     }
 
-                    if (cmd === '/off' || cmd === '/stop') {
+                    if (cmd === '/off') {
                         isBotActive = false;
                         const sent = await sock.sendMessage(replyJid, { text: '[STATUS] Surveillance paused.' });
                         if (sent?.key?.id) botSentMessageIds.add(sent.key.id);
@@ -1422,45 +1661,106 @@ async function startBot() {
                         const sec = parseInt(args[0], 10);
                         if (!isNaN(sec) && sec >= 0 && sec <= 300) {
                             config.settings.resendDelayMs = sec * 1000;
-                            const sent = await sock.sendMessage(replyJid, { text: `[CONFIG] Resend delay set to ${sec} seconds.` });
+                            const sent = await sock.sendMessage(replyJid, { text: `[CONFIG] Resend delay set to ${sec}s.` });
                             if (sent?.key?.id) botSentMessageIds.add(sent.key.id);
                         } else {
-                            const sent = await sock.sendMessage(replyJid, { text: '[USAGE] Invalid delay. Use: /delay <seconds> (e.g. /delay 5)' });
+                            const sent = await sock.sendMessage(replyJid, { text: '[USAGE] /delay <seconds>' });
                             if (sent?.key?.id) botSentMessageIds.add(sent.key.id);
                         }
                         continue;
                     }
 
                     if (cmd === '/exclude') {
-                        const subCmd = (args[0] || '').toLowerCase();
-                        const rawTarget = args[1] || '';
-                        const target = normalizeNumber(rawTarget);
+                        let targetRaw = args[0] || '';
+                        if (targetRaw.toLowerCase() === 'add' && args[1]) targetRaw = args[1];
 
-                        if (subCmd === 'add' && target) {
-                            excludedNumbers.add(target);
-                            const sent = await sock.sendMessage(replyJid, { text: `[EXCLUSION] Added ${target} to exclusion list.` });
-                            if (sent?.key?.id) botSentMessageIds.add(sent.key.id);
-                        } else if (subCmd === 'remove' && target) {
-                            excludedNumbers.delete(target);
-                            const sent = await sock.sendMessage(replyJid, { text: `[EXCLUSION] Removed ${target} from exclusion list.` });
-                            if (sent?.key?.id) botSentMessageIds.add(sent.key.id);
-                        } else if (subCmd === 'list') {
+                        const contextInfo = rawMsg.message?.extendedTextMessage?.contextInfo;
+                        const mentioned = contextInfo?.mentionedJid;
+                        if (Array.isArray(mentioned) && mentioned.length > 0) {
+                            targetRaw = mentioned[0];
+                        } else if (!targetRaw && contextInfo?.participant) {
+                            targetRaw = contextInfo.participant;
+                        }
+
+                        if (targetRaw.toLowerCase() === 'list' || !targetRaw) {
                             if (excludedNumbers.size === 0) {
                                 const sent = await sock.sendMessage(replyJid, { text: '[EXCLUSION] No numbers currently excluded.' });
                                 if (sent?.key?.id) botSentMessageIds.add(sent.key.id);
                             } else {
-                                const list = Array.from(excludedNumbers).map((n, i) => `${i + 1}. +${n}`).join('\n');
+                                const list = Array.from(excludedNumbers).map((n, i) => {
+                                    const linked = lidToPhoneMap.get(n) || phoneToLidMap.get(n);
+                                    return `${i + 1}. +${n}${linked ? ` (linked: +${linked})` : ''}`;
+                                }).join('\n');
                                 const sent = await sock.sendMessage(replyJid, { text: `=== EXCLUDED NUMBERS ===\n${list}\n========================` });
                                 if (sent?.key?.id) botSentMessageIds.add(sent.key.id);
                             }
+                            continue;
+                        }
+
+                        const target = normalizeNumber(targetRaw);
+                        if (target) {
+                            excludedNumbers.add(target);
+                            const linked = lidToPhoneMap.get(target) || phoneToLidMap.get(target);
+                            if (linked) excludedNumbers.add(linked);
+                            saveExcludedNumbers();
+                            const sent = await sock.sendMessage(replyJid, { text: `[EXCLUSION] Excluded +${target}. All messages from this contact will be ignored.` });
+                            if (sent?.key?.id) botSentMessageIds.add(sent.key.id);
                         } else {
-                            const sent = await sock.sendMessage(replyJid, { text: '[USAGE] /exclude add <number> | /exclude remove <number> | /exclude list' });
+                            const sent = await sock.sendMessage(replyJid, { text: '[USAGE] /exclude <number or @mention>' });
                             if (sent?.key?.id) botSentMessageIds.add(sent.key.id);
                         }
                         continue;
                     }
 
-                    if (cmd === '/clearmedia') {
+                    if (cmd === '/unexclude') {
+                        let targetRaw = args[0] || '';
+                        if (targetRaw.toLowerCase() === 'remove' && args[1]) targetRaw = args[1];
+
+                        const contextInfo = rawMsg.message?.extendedTextMessage?.contextInfo;
+                        const mentioned = contextInfo?.mentionedJid;
+                        if (Array.isArray(mentioned) && mentioned.length > 0) {
+                            targetRaw = mentioned[0];
+                        } else if (!targetRaw && contextInfo?.participant) {
+                            targetRaw = contextInfo.participant;
+                        }
+
+                        const target = normalizeNumber(targetRaw);
+                        if (target) {
+                            let removed = false;
+                            const candidates = resolveAllIdentifiers(target);
+                            for (const n of Array.from(excludedNumbers)) {
+                                for (const cand of candidates) {
+                                    if (isExcludedNumberMatch(n, cand)) {
+                                        excludedNumbers.delete(n);
+                                        removed = true;
+                                    }
+                                }
+                            }
+                            saveExcludedNumbers();
+                            const sent = await sock.sendMessage(replyJid, {
+                                text: removed ? `[EXCLUSION] Removed +${target} from exclusion list.` : `[EXCLUSION] +${target} was not in exclusion list.`
+                            });
+                            if (sent?.key?.id) botSentMessageIds.add(sent.key.id);
+                        } else {
+                            const sent = await sock.sendMessage(replyJid, { text: '[USAGE] /unexclude <number or @mention>' });
+                            if (sent?.key?.id) botSentMessageIds.add(sent.key.id);
+                        }
+                        continue;
+                    }
+
+                    if (cmd === '/list') {
+                        if (excludedNumbers.size === 0) {
+                            const sent = await sock.sendMessage(replyJid, { text: '[EXCLUSION] No numbers currently excluded.' });
+                            if (sent?.key?.id) botSentMessageIds.add(sent.key.id);
+                        } else {
+                            const list = Array.from(excludedNumbers).map((n, i) => `${i + 1}. +${n}`).join('\n');
+                            const sent = await sock.sendMessage(replyJid, { text: `=== EXCLUDED NUMBERS ===\n${list}\n========================` });
+                            if (sent?.key?.id) botSentMessageIds.add(sent.key.id);
+                        }
+                        continue;
+                    }
+
+                    if (cmd === '/clear') {
                         cleanMediaDir();
                         messageStore.clear();
                         const sent = await sock.sendMessage(replyJid, { text: '[CLEANUP] In-memory cache and temporary media cleared.' });
@@ -1470,19 +1770,18 @@ async function startBot() {
                 }
             }
 
-            // Skip forensic processing if bot is paused or sender is excluded
+            // Skip forensic processing if bot is paused or sender/chat is excluded
             if (!isBotActive) continue;
-            if (excludedNumbers.has(senderNumber)) continue;
+            if (isExcluded(sender) || isExcluded(senderNumber) || isExcluded(jid)) continue;
 
 
             // 2. Anti-Edit Check: SecretEncryptedMessage (Modern WhatsApp Edits)
             const secretEnc = rawMsg.message?.secretEncryptedMessage;
             if (secretEnc && secretEnc.targetMessageKey?.id) {
                 const targetId = secretEnc.targetMessageKey.id;
-                console.log(`[ANTI-EDIT] Detected SecretEncrypted edit targeting ID: ${targetId}`);
-
                 const stored = messageStore.get(targetId);
                 if (stored) {
+                    if (isExcluded(stored.sender) || isExcluded(stored.originJid) || isExcluded(jid)) continue;
                     let newText = null;
                     const decoded = decryptSecretEncryptedEdit(secretEnc, stored, rawMsg);
                     if (decoded) {
@@ -1492,8 +1791,6 @@ async function startBot() {
                             || getTextMessage(decoded);
                     }
                     await handleEditedNotification(sock, jid, targetId, decoded || secretEnc, newText);
-                } else {
-                    console.log(`[ANTI-EDIT] Target ${targetId} not in cache.`);
                 }
                 continue;
             }
@@ -1501,6 +1798,8 @@ async function startBot() {
             // 4. Anti-Edit Check: Protocol Message Edits
             const editInUpsert = findEditedMessage(rawMsg);
             if (editInUpsert && editInUpsert.targetId) {
+                const stored = messageStore.get(editInUpsert.targetId);
+                if (stored && (isExcluded(stored.sender) || isExcluded(stored.originJid) || isExcluded(jid))) continue;
                 await handleEditedNotification(sock, jid, editInUpsert.targetId, editInUpsert.editedMessage);
                 continue;
             }
@@ -1510,6 +1809,10 @@ async function startBot() {
             if (deletedIdInUpsert) {
                 const stored = messageStore.get(deletedIdInUpsert);
                 if (stored && !stored.resent) {
+                    if (isExcluded(stored.sender) || isExcluded(stored.originJid) || isExcluded(rawMsg.key.participant) || isExcluded(rawMsg.key.remoteJid)) {
+                        console.log(`[EXCLUSION] Revocation for ${deletedIdInUpsert} ignored because contact is excluded.`);
+                        continue;
+                    }
                     stored.resent = true;
                     const deletedBy = rawMsg.key.participant || stored.sender;
                     setTimeout(async () => {
@@ -1573,7 +1876,10 @@ async function startBot() {
             if (deletedId) {
                 const stored = messageStore.get(deletedId);
                 if (stored && !stored.resent) {
-                    if (excludedNumbers.has(normalizeNumber(stored.sender))) continue;
+                    if (isExcluded(stored.sender) || isExcluded(stored.originJid) || isExcluded(update.key?.participant) || isExcluded(update.key?.remoteJid)) {
+                        console.log(`[EXCLUSION] Revocation update for ${deletedId} ignored because contact is excluded.`);
+                        continue;
+                    }
                     stored.resent = true;
                     const deletedBy = update.key?.participant || stored.sender;
                     console.log(`[ANTI-DELETE] Detected deletion for msg ID: ${deletedId}`);
@@ -1589,9 +1895,9 @@ async function startBot() {
                 || update.message?.secretEncryptedMessage;
             if (secretEncInUpdate && secretEncInUpdate.targetMessageKey?.id) {
                 const targetId = secretEncInUpdate.targetMessageKey.id;
-                console.log(`[ANTI-EDIT] Detected SecretEncrypted edit in update targeting ID: ${targetId}`);
                 const stored = messageStore.get(targetId);
                 if (stored) {
+                    if (isExcluded(stored.sender) || isExcluded(stored.originJid) || isExcluded(update.key?.remoteJid)) continue;
                     let newText = null;
                     const decoded = decryptSecretEncryptedEdit(secretEncInUpdate, stored, update);
                     if (decoded) {
@@ -1608,6 +1914,8 @@ async function startBot() {
             // Check for standard Baileys edit updates
             const editData = findEditedMessage(update);
             if (editData && editData.targetId) {
+                const stored = messageStore.get(editData.targetId);
+                if (stored && (isExcluded(stored.sender) || isExcluded(stored.originJid) || isExcluded(update.key?.remoteJid))) continue;
                 await handleEditedNotification(sock, update.key?.remoteJid, editData.targetId, editData.editedMessage);
             }
         }
