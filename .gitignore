@@ -7,6 +7,7 @@ package-lock.json
 .env.*
 !.env.example
 config.json
+auth_info/
 
 # Build & Output
 dist/
