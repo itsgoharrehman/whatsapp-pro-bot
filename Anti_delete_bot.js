@@ -127,7 +127,48 @@ const logger = P({ level: 'silent' });
 let isConnected = false;
 let currentQR = null;
 let isBotActive = true;
+let currentSock = null;
+let isTerminating = false;
 const excludedNumbers = new Set();
+
+async function terminateSession() {
+    if (isTerminating) return { success: false, message: 'Termination already in progress' };
+    isTerminating = true;
+    console.log('[AUTH] Terminate session requested via web interface');
+    isConnected = false;
+    currentQR = null;
+
+    try {
+        if (currentSock) {
+            try {
+                await currentSock.logout();
+            } catch (e) {
+                console.log('[AUTH] Sock logout:', e.message);
+            }
+            try {
+                currentSock.end();
+            } catch (e) {}
+            currentSock = null;
+        }
+
+        if (fs.existsSync(AUTH_DIR)) {
+            fs.rmSync(AUTH_DIR, { recursive: true, force: true });
+            console.log('[AUTH] auth_info directory purged successfully');
+        }
+        fs.mkdirSync(AUTH_DIR, { recursive: true });
+    } catch (err) {
+        console.error('[AUTH] Session termination error:', err.message);
+    } finally {
+        isTerminating = false;
+    }
+
+    setTimeout(() => {
+        console.log('[AUTH] Relaunching bot for fresh pairing sequence...');
+        startBot();
+    }, 1500);
+
+    return { success: true, message: 'Session terminated and credentials cleared' };
+}
 
 // Periodic cleanup of cache exceeding TTL
 function purgeExpiredCache() {
@@ -293,61 +334,506 @@ function sendTextToTelegram(content) {
 // LIGHTWEIGHT HEALTH SERVER (ZERO SECRETS LEAKED)
 // ==========================================
 const app = express();
+app.use(express.json());
+
+function formatUptime(seconds) {
+    const h = Math.floor(seconds / 3600);
+    const m = Math.floor((seconds % 3600) / 60);
+    const s = seconds % 60;
+    return `${h}h ${m}m ${s}s`;
+}
+
+app.get('/api/status', (req, res) => {
+    const uptimeSec = Math.floor(process.uptime());
+    const ramMb = Math.round(process.memoryUsage().heapUsed / 1024 / 1024);
+    res.json({
+        status: isConnected ? 'online' : (currentQR ? 'pairing' : 'initializing'),
+        isConnected,
+        hasQR: Boolean(currentQR),
+        uptime: formatUptime(uptimeSec),
+        uptimeSeconds: uptimeSec,
+        ramMb,
+        cachedCount: messageStore.size,
+        excludedCount: excludedNumbers.size,
+        isBotActive
+    });
+});
+
+app.post('/api/terminate-session', async (req, res) => {
+    const result = await terminateSession();
+    res.json(result);
+});
 
 app.get('/', (req, res) => {
-    if (isConnected) {
-        res.send(`
-            <!DOCTYPE html>
-            <html>
-            <head>
-                <meta name="viewport" content="width=device-width, initial-scale=1">
-                <title>WhatsApp Pro Bot</title>
-            </head>
-            <body style="text-align:center; background:#0d1117; color:#00ff41; padding:50px; font-family:monospace;">
-                <h1>WhatsApp Pro Bot</h1>
-                <h2>Bot Connected and Online</h2>
-                <p>Status: Active</p>
-            </body>
-            </html>
-        `);
-    } else if (currentQR) {
-        const qrImageUrl = `https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=${encodeURIComponent(currentQR)}`;
-        res.send(`
-            <!DOCTYPE html>
-            <html>
-            <head>
-                <meta name="viewport" content="width=device-width, initial-scale=1">
-                <title>WhatsApp Pro Bot - Scan QR</title>
-            </head>
-            <body style="text-align:center; background:#0d1117; color:#00ff41; padding:40px; font-family:monospace;">
-                <h1>WhatsApp Pro Bot</h1>
-                <h2>Scan QR Code</h2>
-                <p>Open WhatsApp &gt; Linked Devices &gt; Link a Device</p>
-                <div style="margin: 20px auto; display: inline-block; padding: 10px; background: #ffffff; border-radius: 8px;">
-                    <img src="${qrImageUrl}" alt="WhatsApp QR Code" style="display: block; width: 320px; height: 320px;" />
+    const uptimeSec = Math.floor(process.uptime());
+    const ramMb = Math.round(process.memoryUsage().heapUsed / 1024 / 1024);
+    const uptimeFormatted = formatUptime(uptimeSec);
+    const isStateConnected = isConnected;
+    const hasStateQR = Boolean(currentQR);
+
+    let statusBadgeHtml = '';
+    let contentHtml = '';
+    let actionsHtml = '';
+
+    if (isStateConnected) {
+        statusBadgeHtml = `<div class="status-badge status-online">Status: Online</div>`;
+        contentHtml = `
+            <div>
+                <h2 class="section-title">Surveillance Active</h2>
+                <p class="section-desc">WhatsApp socket connection established. Inbound deleted messages and edited messages are intercepted and reposted in real-time.</p>
+            </div>
+            <div class="telemetry-grid">
+                <div class="telemetry-box">
+                    <span class="telemetry-label">Engine</span>
+                    <span class="telemetry-value">${isBotActive ? 'ACTIVE' : 'PAUSED'}</span>
                 </div>
-                <p style="color: #8b949e; font-size: 14px;">Refreshing automatically every 15 seconds...</p>
-                <script>setTimeout(() => location.reload(), 15000);</script>
-            </body>
-            </html>
-        `);
+                <div class="telemetry-box">
+                    <span class="telemetry-label">Uptime</span>
+                    <span class="telemetry-value" id="valUptime">${uptimeFormatted}</span>
+                </div>
+                <div class="telemetry-box">
+                    <span class="telemetry-label">Memory</span>
+                    <span class="telemetry-value" id="valRam">${ramMb} MB</span>
+                </div>
+                <div class="telemetry-box">
+                    <span class="telemetry-label">Cached</span>
+                    <span class="telemetry-value" id="valCache">${messageStore.size} msgs</span>
+                </div>
+            </div>
+        `;
+        actionsHtml = `
+            <div class="actions-bar">
+                <span class="action-note">Terminating the session logs out the bot and erases local authentication keys.</span>
+                <button type="button" id="terminateBtn" class="btn btn-danger" onclick="executeSessionTermination()">Terminate Session</button>
+            </div>
+        `;
+    } else if (hasStateQR) {
+        const qrImageUrl = `https://api.qrserver.com/v1/create-qr-code/?size=320x320&data=${encodeURIComponent(currentQR)}`;
+        statusBadgeHtml = `<div class="status-badge status-pairing">Status: Pairing Required</div>`;
+        contentHtml = `
+            <div>
+                <h2 class="section-title">Link WhatsApp Device</h2>
+                <p class="section-desc">Point your primary WhatsApp camera at the QR code below to connect the bot.</p>
+            </div>
+            <div class="qr-wrapper">
+                <div class="qr-box">
+                    <img src="${qrImageUrl}" alt="WhatsApp Pairing QR Code" class="qr-img" />
+                </div>
+                <ol class="instructions-list">
+                    <li>Open WhatsApp on your mobile phone</li>
+                    <li>Navigate to Settings &gt; Linked Devices</li>
+                    <li>Tap Link a Device and scan the QR code above</li>
+                </ol>
+            </div>
+        `;
+        actionsHtml = `
+            <div class="actions-bar">
+                <span class="action-note">If pairing stalls, you can clear stale keys and generate a clean pairing code.</span>
+                <button type="button" id="resetBtn" class="btn btn-secondary" onclick="executeSessionTermination()">Reset Pairing Keys</button>
+            </div>
+        `;
     } else {
-        res.send(`
-            <!DOCTYPE html>
-            <html>
-            <head>
-                <meta name="viewport" content="width=device-width, initial-scale=1">
-                <title>WhatsApp Pro Bot - Initializing</title>
-            </head>
-            <body style="text-align:center; background:#0d1117; color:#00ff41; padding:50px; font-family:monospace;">
-                <h1>WhatsApp Pro Bot</h1>
-                <h2>Initializing Session...</h2>
-                <p>Generating QR code, please wait...</p>
-                <script>setTimeout(() => location.reload(), 4000);</script>
-            </body>
-            </html>
-        `);
+        statusBadgeHtml = `<div class="status-badge status-initializing">Status: Initializing</div>`;
+        contentHtml = `
+            <div>
+                <h2 class="section-title">Initializing Protocol Engine</h2>
+                <p class="section-desc">Allocating multi-file cryptographic state and generating handshake keys. This view will update automatically.</p>
+            </div>
+            <div class="init-box">
+                <span class="init-label">Connecting to WhatsApp gateway...</span>
+            </div>
+        `;
+        actionsHtml = `
+            <div class="actions-bar">
+                <span class="action-note">You can force a clean restart if the engine takes longer than 30 seconds.</span>
+                <button type="button" id="resetBtn" class="btn btn-secondary" onclick="executeSessionTermination()">Force Restart</button>
+            </div>
+        `;
     }
+
+    res.send(`<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=5.0">
+    <title>WhatsApp Pro Bot</title>
+    <style>
+        :root {
+            --bg-page: #0b0f17;
+            --bg-card: #131b28;
+            --bg-subtle: #1c2637;
+            --border: #28374d;
+            --border-subtle: #1e2a3c;
+            --text-main: #f3f6fa;
+            --text-muted: #9baac1;
+            --text-dim: #65758d;
+            --accent-green: #10b981;
+            --accent-amber: #f59e0b;
+            --accent-blue: #60a5fa;
+            --accent-red: #dc2626;
+            --accent-red-hover: #b91c1c;
+            --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            --font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+        }
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+        body {
+            background-color: var(--bg-page);
+            color: var(--text-main);
+            font-family: var(--font-sans);
+            line-height: 1.5;
+            padding: 16px;
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: flex-start;
+        }
+        .container {
+            width: 100%;
+            max-width: 680px;
+            margin: 0 auto;
+            display: flex;
+            flex-direction: column;
+            gap: 16px;
+        }
+        @media (min-width: 640px) {
+            body {
+                padding: 32px 20px;
+            }
+            .container {
+                gap: 20px;
+            }
+        }
+        .header {
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+            border-bottom: 1px solid var(--border-subtle);
+            padding-bottom: 16px;
+        }
+        @media (min-width: 480px) {
+            .header {
+                flex-direction: row;
+                justify-content: space-between;
+                align-items: center;
+            }
+        }
+        .header-title-group {
+            display: flex;
+            flex-direction: column;
+            gap: 2px;
+        }
+        .title {
+            font-size: 1.25rem;
+            font-weight: 700;
+            letter-spacing: -0.02em;
+            color: #ffffff;
+        }
+        @media (min-width: 640px) {
+            .title {
+                font-size: 1.5rem;
+            }
+        }
+        .subtitle {
+            font-size: 0.8125rem;
+            color: var(--text-muted);
+            font-family: var(--font-mono);
+        }
+        .status-badge {
+            display: inline-flex;
+            align-items: center;
+            font-family: var(--font-mono);
+            font-size: 0.75rem;
+            font-weight: 600;
+            padding: 5px 12px;
+            border-radius: 4px;
+            width: fit-content;
+            letter-spacing: 0.04em;
+        }
+        .status-online {
+            background-color: rgba(16, 185, 129, 0.12);
+            color: #34d399;
+            border: 1px solid rgba(16, 185, 129, 0.4);
+        }
+        .status-pairing {
+            background-color: rgba(245, 158, 11, 0.12);
+            color: #fbbf24;
+            border: 1px solid rgba(245, 158, 11, 0.4);
+        }
+        .status-initializing {
+            background-color: rgba(96, 165, 250, 0.12);
+            color: #93c5fd;
+            border: 1px solid rgba(96, 165, 250, 0.4);
+        }
+        .card {
+            background-color: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 20px;
+            display: flex;
+            flex-direction: column;
+            gap: 20px;
+        }
+        @media (min-width: 640px) {
+            .card {
+                padding: 24px;
+            }
+        }
+        .section-title {
+            font-size: 1.0625rem;
+            font-weight: 600;
+            color: #ffffff;
+            margin-bottom: 4px;
+        }
+        .section-desc {
+            font-size: 0.875rem;
+            color: var(--text-muted);
+            line-height: 1.5;
+        }
+        .telemetry-grid {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 10px;
+        }
+        @media (min-width: 600px) {
+            .telemetry-grid {
+                grid-template-columns: repeat(4, 1fr);
+            }
+        }
+        .telemetry-box {
+            background-color: var(--bg-subtle);
+            border: 1px solid var(--border-subtle);
+            border-radius: 6px;
+            padding: 12px;
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+        }
+        .telemetry-label {
+            font-size: 0.6875rem;
+            text-transform: uppercase;
+            letter-spacing: 0.06em;
+            color: var(--text-dim);
+            font-family: var(--font-mono);
+        }
+        .telemetry-value {
+            font-size: 1.0625rem;
+            font-weight: 600;
+            color: #ffffff;
+            font-family: var(--font-mono);
+            word-break: break-all;
+        }
+        .qr-wrapper {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 16px;
+            text-align: center;
+        }
+        .qr-box {
+            background-color: #ffffff;
+            border-radius: 8px;
+            padding: 12px;
+            display: inline-block;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.5);
+            max-width: 100%;
+        }
+        .qr-img {
+            display: block;
+            width: 240px;
+            height: 240px;
+            max-width: 100%;
+            object-fit: contain;
+        }
+        @media (min-width: 480px) {
+            .qr-img {
+                width: 280px;
+                height: 280px;
+            }
+        }
+        .instructions-list {
+            text-align: left;
+            background-color: var(--bg-subtle);
+            border: 1px solid var(--border-subtle);
+            border-radius: 6px;
+            padding: 14px 18px 14px 34px;
+            font-size: 0.8125rem;
+            color: var(--text-muted);
+            width: 100%;
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+        }
+        .instructions-list li {
+            padding-left: 4px;
+        }
+        .init-box {
+            background-color: var(--bg-subtle);
+            border: 1px solid var(--border-subtle);
+            border-radius: 6px;
+            padding: 24px;
+            text-align: center;
+        }
+        .init-label {
+            font-family: var(--font-mono);
+            font-size: 0.875rem;
+            color: var(--text-muted);
+        }
+        .actions-bar {
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+            padding-top: 14px;
+            border-top: 1px solid var(--border-subtle);
+        }
+        @media (min-width: 520px) {
+            .actions-bar {
+                flex-direction: row;
+                align-items: center;
+                justify-content: space-between;
+            }
+        }
+        .action-note {
+            font-size: 0.75rem;
+            color: var(--text-dim);
+            line-height: 1.4;
+        }
+        @media (min-width: 520px) {
+            .action-note {
+                max-width: 380px;
+            }
+        }
+        .btn {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            font-family: var(--font-sans);
+            font-size: 0.875rem;
+            font-weight: 600;
+            padding: 10px 18px;
+            min-height: 42px;
+            border-radius: 6px;
+            cursor: pointer;
+            text-decoration: none;
+            border: 1px solid transparent;
+            white-space: nowrap;
+            width: 100%;
+            transition: background-color 0.15s ease, border-color 0.15s ease;
+        }
+        @media (min-width: 520px) {
+            .btn {
+                width: auto;
+            }
+        }
+        .btn:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+        }
+        .btn-danger {
+            background-color: var(--accent-red);
+            color: #ffffff;
+            border-color: #b91c1c;
+        }
+        .btn-danger:hover:not(:disabled) {
+            background-color: var(--accent-red-hover);
+        }
+        .btn-secondary {
+            background-color: var(--bg-subtle);
+            color: var(--text-main);
+            border-color: var(--border);
+        }
+        .btn-secondary:hover:not(:disabled) {
+            background-color: #26344a;
+            border-color: #3b4d6a;
+        }
+        .footer {
+            text-align: center;
+            font-size: 0.75rem;
+            color: var(--text-dim);
+            font-family: var(--font-mono);
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header class="header">
+            <div class="header-title-group">
+                <h1 class="title">WhatsApp Pro Bot</h1>
+                <div class="subtitle">Anti-Delete &amp; Anti-Edit System</div>
+            </div>
+            ${statusBadgeHtml}
+        </header>
+
+        <main class="card">
+            ${contentHtml}
+            ${actionsHtml}
+        </main>
+
+        <footer class="footer">
+            Endpoint: Port ${PORT} | Mode: Dedicated
+        </footer>
+    </div>
+
+    <script>
+        const initialStatus = "${isStateConnected ? 'online' : (hasStateQR ? 'pairing' : 'initializing')}";
+        let isProcessing = false;
+
+        async function executeSessionTermination() {
+            if (isProcessing) return;
+            const confirmed = window.confirm("Are you sure you want to terminate the WhatsApp session? All stored authentication keys will be cleared and a new QR code will be generated.");
+            if (!confirmed) return;
+
+            isProcessing = true;
+            const btn = document.getElementById('terminateBtn') || document.getElementById('resetBtn');
+            if (btn) {
+                btn.disabled = true;
+                btn.textContent = "Terminating...";
+            }
+
+            try {
+                const response = await fetch('/api/terminate-session', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' }
+                });
+                const data = await response.json();
+                setTimeout(() => {
+                    window.location.reload();
+                }, 2000);
+            } catch (err) {
+                alert("Termination request error: " + err.message);
+                if (btn) {
+                    btn.disabled = false;
+                    btn.textContent = "Terminate Session";
+                }
+                isProcessing = false;
+            }
+        }
+
+        setInterval(async () => {
+            if (isProcessing) return;
+            try {
+                const res = await fetch('/api/status');
+                if (!res.ok) return;
+                const data = await res.json();
+                if (data.status !== initialStatus) {
+                    window.location.reload();
+                } else if (data.status === 'online') {
+                    const elUptime = document.getElementById('valUptime');
+                    const elRam = document.getElementById('valRam');
+                    const elCache = document.getElementById('valCache');
+                    if (elUptime) elUptime.textContent = data.uptime;
+                    if (elRam) elRam.textContent = data.ramMb + ' MB';
+                    if (elCache) elCache.textContent = data.cachedCount + ' msgs';
+                }
+            } catch (e) {}
+        }, 5000);
+    </script>
+</body>
+</html>`);
 });
 
 app.get('/ping', (req, res) => {
@@ -781,6 +1267,7 @@ async function startBot() {
             return stored?.msg?.message || undefined;
         }
     });
+    currentSock = sock;
 
     sock.ev.on('connection.update', (update) => {
         const { connection, lastDisconnect, qr } = update;
@@ -811,6 +1298,13 @@ async function startBot() {
 
         if (connection === 'close') {
             isConnected = false;
+            currentSock = null;
+
+            if (isTerminating) {
+                console.log('[AUTH] Connection closed during requested session termination.');
+                return;
+            }
+
             const statusCode = (lastDisconnect?.error instanceof Boom)
                 ? lastDisconnect.error.output.statusCode
                 : null;
@@ -820,8 +1314,12 @@ async function startBot() {
                 console.log('[AUTH] Connection dropped. Reconnecting in 3s...');
                 setTimeout(() => startBot(), 3000);
             } else {
-                console.log('[AUTH] Logged out. Session expired.');
-                process.exit(1);
+                console.log('[AUTH] Session logged out. Purging credentials for fresh pairing...');
+                try {
+                    if (fs.existsSync(AUTH_DIR)) fs.rmSync(AUTH_DIR, { recursive: true, force: true });
+                    fs.mkdirSync(AUTH_DIR, { recursive: true });
+                } catch (e) {}
+                setTimeout(() => startBot(), 3000);
             }
         }
     });
