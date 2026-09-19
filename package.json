@@ -10,7 +10,7 @@
     "@hapi/boom": "^10.0.1",
     "@whiskeysockets/baileys": "^6.7.18",
     "express": "^4.19.2",
-    "pino": "^9.2.0",
+    "pino": "^10.3.1",
     "qrcode-terminal": "^0.12.0"
   }
 }
