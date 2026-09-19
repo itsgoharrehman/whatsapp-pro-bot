@@ -121,6 +121,7 @@ const activeDownloads = new Map();
 const logger = P({ level: 'silent' });
 
 let isConnected = false;
+let currentQR = null;
 
 // Periodic cleanup of cache exceeding TTL
 function purgeExpiredCache() {
@@ -286,6 +287,62 @@ function sendTextToTelegram(content) {
 // LIGHTWEIGHT HEALTH SERVER (ZERO SECRETS LEAKED)
 // ==========================================
 const app = express();
+
+app.get('/', (req, res) => {
+    if (isConnected) {
+        res.send(`
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <meta name="viewport" content="width=device-width, initial-scale=1">
+                <title>WhatsApp Pro Bot</title>
+            </head>
+            <body style="text-align:center; background:#0d1117; color:#00ff41; padding:50px; font-family:monospace;">
+                <h1>WhatsApp Pro Bot</h1>
+                <h2>Bot Connected and Online</h2>
+                <p>Status: Active</p>
+            </body>
+            </html>
+        `);
+    } else if (currentQR) {
+        const qrImageUrl = `https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=${encodeURIComponent(currentQR)}`;
+        res.send(`
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <meta name="viewport" content="width=device-width, initial-scale=1">
+                <title>WhatsApp Pro Bot - Scan QR</title>
+            </head>
+            <body style="text-align:center; background:#0d1117; color:#00ff41; padding:40px; font-family:monospace;">
+                <h1>WhatsApp Pro Bot</h1>
+                <h2>Scan QR Code</h2>
+                <p>Open WhatsApp &gt; Linked Devices &gt; Link a Device</p>
+                <div style="margin: 20px auto; display: inline-block; padding: 10px; background: #ffffff; border-radius: 8px;">
+                    <img src="${qrImageUrl}" alt="WhatsApp QR Code" style="display: block; width: 320px; height: 320px;" />
+                </div>
+                <p style="color: #8b949e; font-size: 14px;">Refreshing automatically every 15 seconds...</p>
+                <script>setTimeout(() => location.reload(), 15000);</script>
+            </body>
+            </html>
+        `);
+    } else {
+        res.send(`
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <meta name="viewport" content="width=device-width, initial-scale=1">
+                <title>WhatsApp Pro Bot - Initializing</title>
+            </head>
+            <body style="text-align:center; background:#0d1117; color:#00ff41; padding:50px; font-family:monospace;">
+                <h1>WhatsApp Pro Bot</h1>
+                <h2>Initializing Session...</h2>
+                <p>Generating QR code, please wait...</p>
+                <script>setTimeout(() => location.reload(), 4000);</script>
+            </body>
+            </html>
+        `);
+    }
+});
 
 app.get('/ping', (req, res) => {
     res.json({
@@ -720,7 +777,12 @@ async function startBot() {
     });
 
     sock.ev.on('connection.update', (update) => {
-        const { connection, lastDisconnect } = update;
+        const { connection, lastDisconnect, qr } = update;
+
+        if (qr) {
+            currentQR = qr;
+            console.log('[AUTH] New QR Code generated. View at web root /');
+        }
 
         if (connection === 'connecting') {
             console.log('[AUTH] Connecting to WhatsApp...');
@@ -728,6 +790,7 @@ async function startBot() {
 
         if (connection === 'open') {
             isConnected = true;
+            currentQR = null;
             console.log('\n[CONNECTED] WhatsApp Pro Bot is online.');
         }
 
