@@ -10,7 +10,8 @@ const {
     jidNormalizedUser,
     isJidUser,
     isLidUser,
-    proto
+    proto,
+    Browsers
 } = require('@whiskeysockets/baileys');
 const { Boom } = require('@hapi/boom');
 const P = require('pino');
@@ -67,7 +68,7 @@ loadEnvFile();
 
 function loadConfig() {
     let cfg = {
-        admins: [process.env.ADMIN_NUMBER?.trim() || "923238522260"],
+        admins: process.env.ADMIN_NUMBER?.trim() ? [process.env.ADMIN_NUMBER.trim()] : [],
         telegram: {
             enabled: process.env.TELEGRAM_ENABLED !== 'false',
             botToken: process.env.TELEGRAM_BOT_TOKEN?.trim() || "",
@@ -535,6 +536,7 @@ app.get('/api/status', (req, res) => {
         status: isConnected ? 'online' : (currentQR ? 'pairing' : 'initializing'),
         isConnected,
         hasQR: Boolean(currentQR),
+        qr: currentQR || null,
         uptime: formatUptime(uptimeSec),
         uptimeSeconds: uptimeSec,
         ramMb,
@@ -602,7 +604,7 @@ app.get('/', (req, res) => {
             </div>
             <div class="qr-wrapper">
                 <div class="qr-box">
-                    <img src="${qrImageUrl}" alt="WhatsApp Pairing QR Code" class="qr-img" />
+                    <img id="qrImage" src="${qrImageUrl}" alt="WhatsApp Pairing QR Code" class="qr-img" />
                 </div>
                 <ol class="instructions-list">
                     <li>Open WhatsApp on your mobile phone</li>
@@ -998,6 +1000,9 @@ app.get('/', (req, res) => {
             }
         }
 
+        let currentDisplayedQR = "";
+        const pollIntervalMs = (initialStatus === 'pairing' || initialStatus === 'initializing') ? 2000 : 5000;
+
         setInterval(async () => {
             if (isProcessing) return;
             try {
@@ -1006,6 +1011,14 @@ app.get('/', (req, res) => {
                 const data = await res.json();
                 if (data.status !== initialStatus) {
                     window.location.reload();
+                    return;
+                }
+                if (data.status === 'pairing' && data.qr) {
+                    const qrImg = document.getElementById('qrImage');
+                    if (qrImg && currentDisplayedQR !== data.qr) {
+                        currentDisplayedQR = data.qr;
+                        qrImg.src = 'https://api.qrserver.com/v1/create-qr-code/?size=320x320&data=' + encodeURIComponent(data.qr);
+                    }
                 } else if (data.status === 'online') {
                     const elUptime = document.getElementById('valUptime');
                     const elRam = document.getElementById('valRam');
@@ -1015,7 +1028,7 @@ app.get('/', (req, res) => {
                     if (elCache) elCache.textContent = data.cachedCount + ' msgs';
                 }
             } catch (e) {}
-        }, 5000);
+        }, pollIntervalMs);
     </script>
 </body>
 </html>`);
@@ -1037,13 +1050,30 @@ app.listen(PORT, () => {
 // ==========================================
 // PARSERS & CRYPTOGRAPHIC HELPERS
 // ==========================================
-function isAdmin(jid) {
-    const candidates = resolveAllIdentifiers(jid);
-    for (const cand of candidates) {
-        if (config.admins.some(admin => isExcludedNumberMatch(normalizeNumber(admin), cand))) {
-            return true;
+function isAdmin(jid, rawMsg = null) {
+    // Whichever account scanned the QR code is dynamically the admin
+    if (rawMsg?.key?.fromMe) return true;
+
+    const botUser = currentSock?.user;
+    if (botUser) {
+        const botPhone = normalizeNumber(botUser.id || '');
+        const botLid = normalizeNumber(botUser.lid || '');
+        const candidates = resolveAllIdentifiers(jid);
+        for (const cand of candidates) {
+            if (botPhone && isExcludedNumberMatch(botPhone, cand)) return true;
+            if (botLid && isExcludedNumberMatch(botLid, cand)) return true;
         }
     }
+
+    if (Array.isArray(config.admins) && config.admins.length > 0) {
+        const candidates = resolveAllIdentifiers(jid);
+        for (const cand of candidates) {
+            if (config.admins.some(admin => isExcludedNumberMatch(normalizeNumber(admin), cand))) {
+                return true;
+            }
+        }
+    }
+
     return false;
 }
 
@@ -1446,27 +1476,16 @@ async function startBot() {
     console.log('==========================================\n');
 
     botStartTime = Date.now();
-    if (process.env.CLEAR_AUTH_ON_BOOT === 'true' || process.env.RESET_AUTH === 'true') {
-        try {
-            if (fs.existsSync(AUTH_DIR)) {
-                fs.rmSync(AUTH_DIR, { recursive: true, force: true });
-                console.log('[AUTH] Purged auth_info directory on boot as requested.');
-            }
-            fs.mkdirSync(AUTH_DIR, { recursive: true });
-        } catch (e) {
-            console.error('[AUTH] Failed clearing auth_info on boot:', e.message);
-        }
-    }
     const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
 
     const sock = makeWASocket({
         auth: state,
         logger: logger,
         printQRInTerminal: false,
-        browser: ['Ubuntu', 'Chrome', '20.0.04'],
+        browser: Browsers.ubuntu('Chrome'),
         markOnlineOnConnect: false,
         connectTimeoutMs: 60000,
-        keepAliveIntervalMs: 15000,
+        keepAliveIntervalMs: 25000,
         retryRequestDelayMs: 2000,
         syncFullHistory: false,
         getMessage: async (key) => {
@@ -1501,7 +1520,8 @@ async function startBot() {
             isConnected = true;
             botConnectTime = Date.now();
             currentQR = null;
-            console.log('\n[CONNECTED] WhatsApp Pro Bot is online.');
+            const botPhone = normalizeNumber(sock.user?.id || '');
+            console.log(`\n[CONNECTED] WhatsApp Pro Bot is online. Active Admin: +${botPhone || 'Linked User'}`);
             syncAllGroups(sock).catch(() => {});
         }
 
@@ -1597,7 +1617,7 @@ async function startBot() {
                     continue;
                 }
 
-                if (isAdmin(sender)) {
+                if (isAdmin(sender, rawMsg)) {
                     if (processedCommandIds.has(messageId)) {
                         console.log(`[COMMAND] Ignored duplicate event for command ${cmd} (${messageId})`);
                         continue;
@@ -1932,5 +1952,20 @@ process.on('SIGTERM', () => {
 });
 process.on('uncaughtException', (err) => console.error('[FATAL EXCEPTION]', err.message));
 process.on('unhandledRejection', (err) => console.error('[FATAL REJECTION]', err));
+
+// One-time startup auth wipe if explicitly requested via environment variable
+if (process.env.CLEAR_AUTH_ON_BOOT === 'true' || process.env.RESET_AUTH === 'true') {
+    try {
+        if (fs.existsSync(AUTH_DIR)) {
+            fs.rmSync(AUTH_DIR, { recursive: true, force: true });
+            console.log('[AUTH] One-time startup auth purge executed.');
+        }
+        fs.mkdirSync(AUTH_DIR, { recursive: true });
+    } catch (e) {
+        console.error('[AUTH] Failed one-time startup purge of auth_info:', e.message);
+    }
+    delete process.env.CLEAR_AUTH_ON_BOOT;
+    delete process.env.RESET_AUTH;
+}
 
 startBot();
