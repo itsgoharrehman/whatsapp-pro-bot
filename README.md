@@ -1,15 +1,15 @@
 <div align="center">
-  <h1>whatsapp-pro-bot</h1>
+  <h1>whatsapp-sentinel</h1>
   <p>WhatsApp automation bot built on Baileys with Anti-Delete recovery, AES-GCM edit payload decryption, and Telegram Cloud archival.</p>
 
   <p>
-    <a href="https://github.com/itsgoharrehman/whatsapp-pro-bot/releases"><img src="https://img.shields.io/github/v/release/itsgoharrehman/whatsapp-pro-bot?style=flat-square&logo=github&logoColor=white" alt="Release"></a>
+    <a href="https://github.com/itsgoharrehman/whatsapp-sentinel/releases"><img src="https://img.shields.io/github/v/release/itsgoharrehman/whatsapp-sentinel?style=flat-square&logo=github&logoColor=white" alt="Release"></a>
     <img src="https://img.shields.io/badge/License-Proprietary-red?style=flat-square&logo=gitbook&logoColor=white" alt="License">
     <img src="https://img.shields.io/badge/Runtime-Node.js_18+-339933?style=flat-square&logo=nodedotjs&logoColor=white" alt="Node.js">
     <img src="https://img.shields.io/badge/Protocol-Baileys-25D366?style=flat-square&logo=whatsapp&logoColor=white" alt="Baileys">
     <img src="https://img.shields.io/badge/Storage-Telegram_Cloud-26A5E4?style=flat-square&logo=telegram&logoColor=white" alt="Telegram">
-    <a href="https://github.com/itsgoharrehman/whatsapp-pro-bot/stargazers"><img src="https://img.shields.io/github/stars/itsgoharrehman/whatsapp-pro-bot?style=flat-square&logo=github&logoColor=white" alt="Stars"></a>
-    <a href="https://github.com/itsgoharrehman/whatsapp-pro-bot/issues"><img src="https://img.shields.io/github/issues/itsgoharrehman/whatsapp-pro-bot?style=flat-square&logo=github&logoColor=white" alt="Issues"></a>
+    <a href="https://github.com/itsgoharrehman/whatsapp-sentinel/stargazers"><img src="https://img.shields.io/github/stars/itsgoharrehman/whatsapp-sentinel?style=flat-square&logo=github&logoColor=white" alt="Stars"></a>
+    <a href="https://github.com/itsgoharrehman/whatsapp-sentinel/issues"><img src="https://img.shields.io/github/issues/itsgoharrehman/whatsapp-sentinel?style=flat-square&logo=github&logoColor=white" alt="Issues"></a>
   </p>
 </div>
 
@@ -17,7 +17,7 @@
 
 ## Overview
 
-whatsapp-pro-bot is a resilient WhatsApp automation daemon engineered on `@whiskeysockets/baileys`. It provides real-time intercept and recovery for revoked messages, cryptographic decryption of edit payloads, and permanent offloading of media assets directly to a private Telegram channel.
+whatsapp-sentinel is a resilient WhatsApp automation daemon engineered on `@whiskeysockets/baileys`. It provides real-time intercept and recovery for revoked messages, cryptographic decryption of edit payloads, and permanent offloading of media assets directly to a private Telegram channel.
 
 By utilizing Telegram's Bot API as an object and document storage layer, the bot maintains a strict zero-disk local footprint, eliminating local storage accumulation on server hosts.
 
@@ -27,7 +27,7 @@ By utilizing Telegram's Bot API as an object and document storage layer, the bot
 sequenceDiagram
     autonumber
     participant Chat as WhatsApp Network
-    participant Bot as whatsapp-pro-bot Daemon
+    participant Bot as whatsapp-sentinel Daemon
     participant Buffer as In-Memory LRU Buffer
     participant TG as Telegram Cloud Storage
 
@@ -78,8 +78,8 @@ sequenceDiagram
 ### 1. Clone the Repository
 
 ```bash
-git clone https://github.com/itsgoharrehman/whatsapp-pro-bot.git
-cd whatsapp-pro-bot
+git clone https://github.com/itsgoharrehman/whatsapp-sentinel.git
+cd whatsapp-sentinel
 ```
 
 ### 2. Install Dependencies
@@ -119,7 +119,7 @@ node Anti_delete_bot.js
 
 # Production daemon via PM2
 npm install -g pm2
-pm2 start Anti_delete_bot.js --name "whatsapp-pro-bot"
+pm2 start Anti_delete_bot.js --name "whatsapp-sentinel"
 pm2 save
 ```
 
